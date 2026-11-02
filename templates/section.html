@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading">
+  <div><div class="eyebrow">ATTACK SURFACE REDUCTION</div><h1>{{ title }}</h1><p id="sectionDescription">Current verified system state is synchronized automatically.</p></div>
+  {% if active_page in ["scanner", "dashboard"] %}<button class="btn btn-primary scan-button" data-scan>↻ &nbsp;Run local scan</button>{% endif %}
+</div>
+<div id="operationStatus" class="status-banner" role="status" hidden></div>
+<div class="section-toolbar">
+  <span class="data-freshness"><span class="pulse-dot"></span> Live local data · updates every 5 seconds</span>
+  {% if active_page in ["scanner", "processes", "risks", "history", "firewall"] %}
+  <label class="table-search">SEARCH <input id="tableSearch" type="search" placeholder="Filter visible rows" aria-label="Filter visible table rows"></label>
+  {% endif %}
+  {% if active_page == "scanner" %}
+  <label class="port-input">PORTS <input id="portsInput" value="22,80,443,445,3389,5000,8080" aria-label="Comma separated ports"></label>
+  <label class="detection-option"><input id="serviceDetection" type="checkbox"> Enable Nmap service/version detection (-sV)</label>
+  <button class="btn btn-primary" data-scan>Scan selected ports</button>
+  {% endif %}
+  {% if active_page == "firewall" %}
+  <button class="btn btn-outline-light btn-sm" id="adminStatus">Checking permissions…</button>
+  {% endif %}
+  {% if active_page == "reports" %}
+  <a class="btn btn-outline-light btn-sm" href="/api/reports/excel">Download Excel</a>
+  <a class="btn btn-outline-light btn-sm" href="/api/reports/pdf">Download PDF</a>
+  {% endif %}
+</div>
+{% if active_page == "scanner" %}
+<div class="scope-notice">Scope: <strong>127.0.0.1 only (loopback)</strong>. This is not a remote-accessibility test. Listener inventory, firewall configuration, and network reachability are separate observations.</div>
+<div class="metric-strip"><span>OPEN <b id="openStateCount">0</b></span><span>CLOSED <b id="closedStateCount">0</b></span><span>FILTERED <b id="filteredStateCount">0</b></span><span>OPEN|FILTERED <b id="openFilteredStateCount">0</b></span><span id="scanScopeLabel">NO VERIFIED SCOPE</span></div>
+<section class="panel"><div class="panel-heading"><div><h2>TCP & UDP scan results</h2><p>Nmap states are observations; open|filtered is inconclusive. Service names from the port database are hints, not confirmed application IDs.</p></div></div><div class="table-responsive"><table class="table app-table"><thead><tr><th>PROTOCOL</th><th>PORT</th><th>STATE</th><th>SERVICE IDENTIFICATION</th><th>CONFIDENCE</th><th>REASON</th><th>PROCESS</th></tr></thead><tbody id="scanTable"><tr><td colspan="7" class="empty-state">No scans yet.</td></tr></tbody></table></div></section>
+{% elif active_page == "processes" %}
+<section class="panel"><div class="panel-heading"><div><h2>Listening sockets</h2><p>Local listener inventory from Psutil. It does not prove a port is reachable remotely. Unavailable fields may require elevated access.</p></div></div><div class="table-responsive"><table class="table app-table"><thead><tr><th>PROTOCOL</th><th>LOCAL ADDRESS</th><th>PORT</th><th>PID</th><th>PROCESS</th><th>EXECUTABLE</th></tr></thead><tbody id="processTable"><tr><td colspan="6" class="empty-state">No listening processes.</td></tr></tbody></table></div></section>
+{% elif active_page == "risks" %}
+<section class="panel"><div class="panel-heading"><div><h2>Risk findings</h2><p>Open ports are not automatically treated as vulnerabilities; known service exposure receives higher priority.</p></div></div><div class="table-responsive"><table class="table app-table"><thead><tr><th>SEVERITY</th><th>PORT</th><th>SERVICE</th><th>FIREWALL</th><th>LISTENER STATE</th><th>RECOMMENDATION</th><th>ACTION</th></tr></thead><tbody id="riskTable"><tr><td colspan="7" class="empty-state">Run a scan to assess local exposure.</td></tr></tbody></table></div></section>
+<div class="method-note mt-3">Transparent model: score starts at 100 and subtracts severity-weighted points for exposed open ports (Critical 25, High 15, Medium 8, Low 3; capped at 100). A verified matching inbound firewall rule removes that port from exposed findings, but does not stop its service. The model is a prioritization aid, not a vulnerability scanner.</div>
+{% elif active_page == "firewall" %}
+<section class="panel"><div class="panel-heading"><div><h2>Create inbound restriction</h2><p>Administrator rights and explicit confirmation are required. The app creates only its own inbound block rules.</p></div></div><form id="firewallForm" class="firewall-form"><label>PROTOCOL<select id="ruleProtocol"><option>TCP</option><option>UDP</option></select></label><label>LOCAL PORT<input id="rulePort" type="number" min="1" max="65535" required placeholder="e.g. 8090"></label><button class="btn btn-danger" type="submit">Review & restrict</button></form></section>
+<section class="panel mt-4"><div class="panel-heading"><div><h2>Live inbound block rules</h2><p>Windows Firewall is queried live. Only rules with a stored application identity can be rolled back; rule configuration is not a remote traffic test.</p></div></div><div class="table-responsive"><table class="table app-table"><thead><tr><th>RULE</th><th>PROTOCOL</th><th>PORT</th><th>ENABLED</th><th>DIRECTION / ACTION</th><th>VERIFICATION</th><th>ACTION</th></tr></thead><tbody id="firewallTable"><tr><td colspan="7" class="empty-state">No inbound block rules.</td></tr></tbody></table></div></section>
+{% elif active_page == "monitoring" %}
+<section class="stat-grid monitoring-grid"><article class="stat-card"><div class="stat-label">CPU UTILIZATION</div><div class="stat-value"><span id="cpuValue">--</span><small>%</small></div><div class="progress"><div id="cpuBar" class="progress-bar"></div></div></article><article class="stat-card"><div class="stat-label">MEMORY UTILIZATION</div><div class="stat-value"><span id="memoryValue">--</span><small>%</small></div><div class="progress"><div id="memoryBar" class="progress-bar"></div></div><div class="stat-note"><span id="memoryUsed">--</span> MB used</div></article><article class="stat-card"><div class="stat-label">RUNNING PROCESSES</div><div class="stat-value" id="processCount">--</div><div class="stat-note">Local process snapshot</div></article></section>
+<section class="panel mt-4"><div class="panel-heading"><div><h2>Recent security events</h2><p>Scan history, firewall changes, and errors.</p></div></div><div id="eventsList" class="event-list"><div class="empty-state">No events recorded.</div></div></section>
+{% elif active_page == "comparison" %}
+<section class="stat-grid"><article class="stat-card"><div class="stat-label">BASELINE EXPOSED</div><div class="stat-value" id="baselineCount">--</div></article><article class="stat-card"><div class="stat-label">CURRENTLY EXPOSED</div><div class="stat-value" id="currentCount">--</div></article><article class="stat-card"><div class="stat-label">RESTRICTED SINCE BASELINE</div><div class="stat-value" id="restrictedCount">--</div></article><article class="stat-card"><div class="stat-label">SCORE IMPROVEMENT</div><div class="stat-value" id="scoreImprovement">--</div></article></section>
+<section class="panel"><div class="panel-heading"><div><h2>Comparison baseline</h2><p id="baselineDetails">The first complete verified assessment is kept until you explicitly select a new baseline.</p></div></div><div class="baseline-controls"><select id="baselineSelect" aria-label="Choose a complete verified scan"></select><button class="btn btn-outline-light" id="setBaseline">Set selected baseline</button><button class="btn btn-primary" id="scanBaselineScope">Scan selected baseline scope</button></div><div id="comparisonStatus" class="scope-notice mt-3">Checking comparison scope…</div></section>
+<section class="panel mt-4"><div class="panel-heading"><div><h2>Exposure comparison</h2><p>A firewall restriction does not imply the listening service stopped. Missing from a scan is not proof that a service stopped.</p></div></div><div class="compare-columns"><div><h3>Initially exposed</h3><div id="initiallyExposed" class="tag-list"></div></div><div><h3>Currently exposed</h3><div id="currentlyExposed" class="tag-list"></div></div><div><h3>Restricted by verified rule</h3><div id="restrictedPorts" class="tag-list"></div></div><div><h3>No longer observed open</h3><div id="noLongerOpen" class="tag-list"></div></div><div><h3>Remaining high risk</h3><div id="remainingRisks" class="tag-list"></div></div></div><p class="comparison-note">Attack-surface reduction: <strong id="reductionPercent">--</strong></p></section>
+{% elif active_page == "history" %}
+<section class="panel"><div class="panel-heading"><div><h2>Assessment history</h2><p>Only successfully verified scans are stored as current assessments.</p></div></div><div class="table-responsive"><table class="table app-table"><thead><tr><th>SCAN ID</th><th>TIME</th><th>STATUS</th><th>SOURCE</th><th>SCORE</th><th>EXPOSED</th></tr></thead><tbody id="historyTable"><tr><td colspan="6" class="empty-state">No scan history.</td></tr></tbody></table></div></section>
+{% elif active_page == "reports" %}
+<section class="panel"><div class="panel-heading"><div><h2>Export latest assessment</h2><p>Download a report generated from the latest stored assessment and audit events.</p></div></div><div class="report-cards"><a class="report-card" href="/api/reports/excel"><span>▦</span><strong>Excel workbook</strong><small>Port results, risk findings, and audit events</small><b>Download .xlsx →</b></a><a class="report-card" href="/api/reports/pdf"><span>▤</span><strong>PDF summary</strong><small>Printable security assessment summary</small><b>Download .pdf →</b></a></div></section>
+<section class="panel mt-4"><div class="panel-heading"><div><h2>Audit log</h2><p>Security and scan operations recorded locally.</p></div></div><div id="auditList" class="event-list"><div class="empty-state">No audit records.</div></div></section>
+{% endif %}
+{% endblock %}

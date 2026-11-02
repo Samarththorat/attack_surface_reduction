@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-heading">
+  <div><div class="eyebrow">YOUR SECURITY AT A GLANCE</div><h1>Security overview</h1><p>Local system exposure, scan status, and priority findings.</p></div>
+  <button class="btn btn-primary scan-button" data-scan>↻ &nbsp;Run local scan</button>
+</div>
+<div id="statusBanner" class="status-banner">No verified assessment yet. Run a scan to establish your baseline.</div>
+<section class="stat-grid">
+  <article class="stat-card score-card"><div class="stat-label">SECURITY SCORE</div><div class="score-wrap"><div id="scoreValue" class="score-value">--</div><div class="score-caption">/ 100<br><span id="scoreLabel">Awaiting scan</span></div></div><div class="score-track"><span id="scoreBar"></span></div></article>
+  <article class="stat-card"><div class="stat-top"><span class="stat-label">EXPOSED PORTS</span><span class="stat-icon cyan">⌁</span></div><div class="stat-value" id="exposedCount">--</div><div class="stat-note">Open without a verified restriction</div></article>
+  <article class="stat-card"><div class="stat-top"><span class="stat-label">HIGH-RISK FINDINGS</span><span class="stat-icon red">!</span></div><div class="stat-value" id="highRiskCount">--</div><div class="stat-note">Critical and high priority</div></article>
+  <article class="stat-card"><div class="stat-top"><span class="stat-label">FIREWALL RULES</span><span class="stat-icon purple">⬡</span></div><div class="stat-value" id="firewallCount">--</div><div class="stat-note">Application-created, verified</div></article>
+</section>
+<section class="content-grid">
+  <article class="panel chart-panel"><div class="panel-heading"><div><h2>Port exposure</h2><p>Most recent verified TCP and UDP observations</p></div><a href="/scanner" class="subtle-link">View scan →</a></div><div class="chart-area"><canvas id="exposureChart"></canvas><div id="chartEmpty" class="empty-chart">Run a scan to see port states</div></div></article>
+  <article class="panel"><div class="panel-heading"><div><h2>Risk distribution</h2><p>Unrestricted open services only</p></div></div><div class="risk-list" id="riskSummary"><div class="empty-state">No verified findings yet</div></div><div class="method-note">Score method: severity-weighted unverified exposure. A firewall rule alone does not increase the score.</div></article>
+</section>
+<section class="panel mt-4"><div class="panel-heading"><div><h2>Priority findings</h2><p>Review services before applying restrictions.</p></div><a href="/risks" class="subtle-link">All findings →</a></div><div class="table-responsive"><table class="table app-table"><thead><tr><th>PORT</th><th>SERVICE</th><th>SEVERITY</th><th>STATUS</th><th>RECOMMENDATION</th></tr></thead><tbody id="findingsTable"><tr><td colspan="5" class="empty-state">Run a local scan to populate findings.</td></tr></tbody></table></div></section>
+{% endblock %}
