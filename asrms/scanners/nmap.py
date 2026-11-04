@@ -116,7 +116,9 @@ def scan_local_ports(ports, nmap_path=None, timeout=45, service_detection=False,
             port_list,
         ]
         if service_detection:
-            command.extend(["-sV", "--version-light", "--version-timeout", "5s"])
+            command.extend(
+                ["-sV", "--version-light", "--version-timeout", f"{int(version_timeout)}s"]
+            )
         command.extend([
             "-oX",
             "-",

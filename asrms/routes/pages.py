@@ -16,6 +16,8 @@ def section(page):
         "risks": "Risk Analysis",
         "firewall": "Firewall Manager",
         "monitoring": "System Monitoring",
+        "url-scanner": "URL Security Scanner",
+        "port-monitoring": "Continuous Port Monitoring",
         "comparison": "Before & After",
         "history": "Scan History",
         "reports": "Reports & Audit",

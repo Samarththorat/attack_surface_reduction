@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 from flask import Flask, abort, request, session
 
 from asrms.database import init_app
+from asrms.monitoring.ports import start_worker
 from asrms.routes import register_routes
 
 
@@ -24,6 +25,21 @@ def create_app(test_config=None):
         NMAP_VERSION_TIMEOUT=90,
         MAX_SCAN_PORTS=100,
         MONITOR_POLL_SECONDS=5,
+        PORT_MONITOR_ENABLED=os.environ.get("ASRMS_PORT_MONITOR_ENABLED", "true").lower()
+        not in {"0", "false", "no", "off"},
+        PORT_MONITOR_INTERVAL_SECONDS=int(
+            os.environ.get("ASRMS_PORT_MONITOR_INTERVAL_SECONDS", "5")
+        ),
+        PORT_MONITOR_PERSISTENT_SECONDS=int(
+            os.environ.get(
+                "ASRMS_TCP_PERSISTENT_SECONDS",
+                os.environ.get("ASRMS_PORT_MONITOR_PERSISTENT_SECONDS", "30"),
+            )
+        ),
+        UDP_PERSISTENT_SECONDS=int(os.environ.get("ASRMS_UDP_PERSISTENT_SECONDS", "60")),
+        ALERT_COOLDOWN_SECONDS=int(
+            os.environ.get("ASRMS_ALERT_COOLDOWN_SECONDS", "300")
+        ),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Strict",
         SESSION_COOKIE_SECURE=False,
@@ -66,4 +82,5 @@ def create_app(test_config=None):
 
     init_app(app)
     register_routes(app)
+    start_worker(app)
     return app

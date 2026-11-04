@@ -44,8 +44,62 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS url_scans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    submitted_url TEXT NOT NULL,
+    normalized_url TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    risk_score INTEGER NOT NULL,
+    risk_level TEXT NOT NULL,
+    analysis_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS url_security_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id INTEGER NOT NULL REFERENCES url_scans(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    code TEXT NOT NULL,
+    message TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS port_monitor_snapshots (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    observed_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    error TEXT
+);
+CREATE TABLE IF NOT EXISTS port_activity_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    event_key TEXT NOT NULL UNIQUE,
+    details_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS firewall_profile_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    collection_status TEXT NOT NULL,
+    profiles_json TEXT NOT NULL,
+    error TEXT
+);
+CREATE TABLE IF NOT EXISTS security_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    category TEXT NOT NULL,
+    message TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    event_key TEXT NOT NULL UNIQUE,
+    read_at TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_scans_created_at ON scans(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);
+CREATE INDEX IF NOT EXISTS idx_url_scans_created_at ON url_scans(created_at);
+CREATE INDEX IF NOT EXISTS idx_url_findings_scan_id ON url_security_findings(scan_id);
+CREATE INDEX IF NOT EXISTS idx_port_activity_created_at ON port_activity_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_firewall_profiles_created_at ON firewall_profile_snapshots(created_at);
+CREATE INDEX IF NOT EXISTS idx_security_notifications_created_at ON security_notifications(created_at);
 """
 
 
@@ -114,6 +168,15 @@ def _migrate_schema(db):
             row["name"] for row in db.execute("PRAGMA table_info(firewall_rules)").fetchall()
         }
         migration_needed = migration_needed or "instance_id" not in firewall_columns
+    expected_tables = {
+        "url_scans",
+        "url_security_findings",
+        "port_monitor_snapshots",
+        "port_activity_events",
+        "firewall_profile_snapshots",
+        "security_notifications",
+    }
+    migration_needed = migration_needed or bool(tables.intersection({"scans", "firewall_rules"}) and expected_tables - tables)
     if migration_needed and path.is_file() and path.stat().st_size:
         _backup_database(path)
     db.executescript(SCHEMA)
@@ -246,16 +309,28 @@ def set_latest_scan_error(error):
     set_setting("latest_scan_error", error[:500])
 
 
-def update_scan_security_state(scan_id, risk, firewall_rules):
+def update_scan_security_state(scan_id, risk, firewall_rules, verification=None):
     db = get_db()
-    db.execute(
-        "UPDATE scans SET risk_json = ?, firewall_json = ? WHERE id = ?",
-        (
-            json.dumps(risk, separators=(",", ":")),
-            json.dumps(firewall_rules, separators=(",", ":")),
-            scan_id,
-        ),
-    )
+    if verification is None:
+        db.execute(
+            "UPDATE scans SET risk_json = ?, firewall_json = ? WHERE id = ?",
+            (
+                json.dumps(risk, separators=(",", ":")),
+                json.dumps(firewall_rules, separators=(",", ":")),
+                scan_id,
+            ),
+        )
+    else:
+        db.execute(
+            """UPDATE scans SET risk_json = ?, firewall_json = ?, verification_json = ?
+               WHERE id = ?""",
+            (
+                json.dumps(risk, separators=(",", ":")),
+                json.dumps(firewall_rules, separators=(",", ":")),
+                json.dumps(verification, separators=(",", ":")),
+                scan_id,
+            ),
+        )
     db.commit()
 
 
@@ -348,3 +423,217 @@ def set_setting(key, value):
         (key, value),
     )
     db.commit()
+
+
+def save_url_scan(submitted_url, analysis):
+    db = get_db()
+    created_at = utc_now()
+    cursor = db.execute(
+        """INSERT INTO url_scans
+           (created_at, submitted_url, normalized_url, domain, risk_score, risk_level, analysis_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            created_at,
+            submitted_url,
+            analysis["normalized_url"],
+            analysis["domain"],
+            analysis["risk_score"],
+            analysis["risk_level"],
+            json.dumps(analysis, separators=(",", ":")),
+        ),
+    )
+    scan_id = cursor.lastrowid
+    db.executemany(
+        """INSERT INTO url_security_findings
+           (scan_id, created_at, severity, code, message) VALUES (?, ?, ?, ?, ?)""",
+        [
+            (scan_id, created_at, finding["severity"], finding["code"], finding["message"])
+            for finding in analysis["findings"]
+        ],
+    )
+    db.commit()
+    return scan_id, created_at
+
+
+def list_url_scans(limit=50):
+    rows = get_db().execute(
+        """SELECT id, created_at, submitted_url, normalized_url, domain,
+                  risk_score, risk_level, analysis_json
+           FROM url_scans ORDER BY id DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "submitted_url": row["submitted_url"],
+            "normalized_url": row["normalized_url"],
+            "domain": row["domain"],
+            "risk_score": row["risk_score"],
+            "risk_level": row["risk_level"],
+            "analysis": json.loads(row["analysis_json"]),
+        }
+        for row in rows
+    ]
+
+
+def save_port_monitor_snapshot(snapshot, status="verified", error=None):
+    db = get_db()
+    db.execute(
+        """INSERT INTO port_monitor_snapshots (id, observed_at, status, snapshot_json, error)
+           VALUES (1, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET observed_at=excluded.observed_at,
+             status=excluded.status, snapshot_json=excluded.snapshot_json, error=excluded.error""",
+        (utc_now(), status, json.dumps(snapshot, separators=(",", ":")), error),
+    )
+    db.commit()
+
+
+def get_port_monitor_snapshot():
+    row = get_db().execute(
+        "SELECT * FROM port_monitor_snapshots WHERE id = 1"
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "observed_at": row["observed_at"],
+        "status": row["status"],
+        "listeners": json.loads(row["snapshot_json"]),
+        "error": row["error"],
+    }
+
+
+def record_port_activity(event_type, event_key, details):
+    db = get_db()
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO port_activity_events
+           (created_at, event_type, event_key, details_json) VALUES (?, ?, ?, ?)""",
+        (utc_now(), event_type, event_key, json.dumps(details, separators=(",", ":"))),
+    )
+    db.commit()
+    return cursor.rowcount == 1
+
+
+def list_port_activity(limit=100):
+    rows = get_db().execute(
+        """SELECT id, created_at, event_type, event_key, details_json
+           FROM port_activity_events ORDER BY id DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "event_type": row["event_type"],
+            "event_key": row["event_key"],
+            "details": json.loads(row["details_json"]),
+        }
+        for row in rows
+    ]
+
+
+def save_firewall_profile_snapshot(profiles, collection_status, error=None, observed_at=None):
+    db = get_db()
+    db.execute(
+        """INSERT INTO firewall_profile_snapshots
+           (created_at, collection_status, profiles_json, error) VALUES (?, ?, ?, ?)""",
+        (
+            observed_at or utc_now(),
+            collection_status,
+            json.dumps(profiles, separators=(",", ":")),
+            error,
+        ),
+    )
+    db.commit()
+
+
+def get_latest_firewall_profile_snapshot():
+    row = get_db().execute(
+        "SELECT * FROM firewall_profile_snapshots ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "verified_at": row["created_at"],
+        "collection_status": row["collection_status"],
+        "profiles": json.loads(row["profiles_json"]),
+        "error": row["error"],
+    }
+
+
+def record_security_notification(
+    severity,
+    category,
+    message,
+    details,
+    event_key,
+    cooldown_seconds=0,
+    group_key=None,
+):
+    db = get_db()
+    if cooldown_seconds and group_key:
+        rows = db.execute(
+            """SELECT created_at, details_json FROM security_notifications
+               WHERE category = ? ORDER BY id DESC LIMIT 100""",
+            (category,),
+        ).fetchall()
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            try:
+                prior_time = datetime.fromisoformat(row["created_at"])
+                prior_details = json.loads(row["details_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                prior_details.get("socket_id") == group_key
+                and (now - prior_time).total_seconds() < cooldown_seconds
+            ):
+                return False
+    cursor = db.execute(
+        """INSERT OR IGNORE INTO security_notifications
+           (created_at, severity, category, message, details_json, event_key)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            utc_now(),
+            severity,
+            category,
+            message,
+            json.dumps(details, separators=(",", ":")),
+            event_key,
+        ),
+    )
+    db.commit()
+    return cursor.rowcount == 1
+
+
+def list_security_notifications(limit=50):
+    rows = get_db().execute(
+        """SELECT id, created_at, severity, category, message, details_json, read_at
+           FROM security_notifications ORDER BY id DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "created_at": row["created_at"],
+            "severity": row["severity"],
+            "category": row["category"],
+            "message": row["message"],
+            "details": json.loads(row["details_json"]),
+            "read_at": row["read_at"],
+            "dismissed": bool(row["read_at"]),
+        }
+        for row in rows
+    ]
+
+
+def dismiss_security_notification(notification_id):
+    db = get_db()
+    db.execute(
+        "UPDATE security_notifications SET read_at = COALESCE(read_at, ?) WHERE id = ?",
+        (utc_now(), notification_id),
+    )
+    db.commit()
+    return db.execute(
+        "SELECT id FROM security_notifications WHERE id = ?", (notification_id,)
+    ).fetchone() is not None

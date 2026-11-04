@@ -66,6 +66,23 @@ class DatabaseMigrationTests(unittest.TestCase):
             )
             columns = {row[1] for row in migrated.execute("PRAGMA table_info(scans)")}
             self.assertTrue({"scan_scope_json", "complete", "firewall_json", "verification_json"} <= columns)
+            tables = {
+                row[0]
+                for row in migrated.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            self.assertTrue(
+                {
+                    "url_scans",
+                    "url_security_findings",
+                    "port_monitor_snapshots",
+                    "port_activity_events",
+                    "firewall_profile_snapshots",
+                    "security_notifications",
+                }
+                <= tables
+            )
             firewall_columns = {row[1] for row in migrated.execute("PRAGMA table_info(firewall_rules)")}
             self.assertIn("instance_id", firewall_columns)
             migrated.close()

@@ -18,7 +18,7 @@ def excel():
             download_name="asrms-security-report.xlsx",
         )
     except (FirewallError, sqlite3.Error, ValueError, OSError) as exc:
-        return {"error": f"Report could not verify current firewall/database state: {exc}"}, 503
+        return {"error": f"Report generation failed: {exc}"}, 503
 
 
 @reports.get("/pdf")
@@ -31,4 +31,4 @@ def pdf():
             download_name="asrms-security-report.pdf",
         )
     except (FirewallError, sqlite3.Error, ValueError, OSError) as exc:
-        return {"error": f"Report could not verify current firewall/database state: {exc}"}, 503
+        return {"error": f"Report generation failed: {exc}"}, 503

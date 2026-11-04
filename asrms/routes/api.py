@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 from datetime import datetime, timezone
 
 import psutil
@@ -6,11 +7,14 @@ from flask import Blueprint, current_app, jsonify, request
 
 from asrms import database
 from asrms.firewall import manager
+from asrms.monitoring.ports import port_monitor_payload
 from asrms.scanners.nmap import ScanError, scan_local_ports
 from asrms.scanners.processes import listening_processes
-from asrms.security.risk import analyze_risk
+from asrms.security.risk import analyze_risk, firewall_profile_health
+from asrms.security.url_scanner import URLValidationError, analyze_url
 
 api = Blueprint("api", __name__)
+_FIREWALL_PROFILE_LOCK = threading.Lock()
 DEFAULT_PORTS = [21, 22, 23, 53, 80, 135, 139, 443, 445, 1433, 3306, 3389, 5000, 5432, 5900, 8080, 8443]
 
 
@@ -188,6 +192,8 @@ def _current_assessment_status():
     if database.get_latest_complete_scan():
         return status or "verified"
     if database.get_latest_scan():
+        if status == "incomplete":
+            return "incomplete"
         return "legacy_scope_unknown"
     return "unavailable"
 
@@ -209,9 +215,12 @@ def _process_inventory_payload(scan):
     if _current_assessment_status() == "stale" or scan.get("status") == "stale":
         status = "stale"
         error = database.get_setting("latest_scan_error") or "Listener inventory may be out of date."
-    elif not scan.get("complete"):
+    elif not scan.get("complete") and scan.get("status") != "incomplete":
         status = "legacy_scope_unknown"
         error = "This legacy listener inventory has no verified scan scope."
+    elif not scan.get("complete"):
+        status = "incomplete"
+        error = "Firewall profile verification failed; run a complete assessment."
     else:
         status = "verified" if listeners else "empty"
         error = None
@@ -225,8 +234,23 @@ def _process_inventory_payload(scan):
 
 def _sync_security_state():
     actual_rules, application_rules, verification_changed = _actual_firewall_state()
+    profile_state = _get_firewall_profile_state()
     latest = database.get_latest_complete_scan()
     if latest:
+        prior_profiles = latest.get("verification", {}).get("firewall_profiles")
+        previous_profile_state = {
+            item.get("name"): item.get("enabled")
+            for item in (prior_profiles or {}).get("profiles", [])
+        }
+        current_profile_state = {
+            item.get("name"): item.get("enabled")
+            for item in profile_state.get("profiles", [])
+        }
+        profiles_changed = bool(
+            profile_state.get("collection_status") == "verified"
+            and previous_profile_state
+            and previous_profile_state != current_profile_state
+        )
         prior_snapshot = sorted(
             repr(item.get("observed_rule"))
             for item in latest.get("firewall_rules", [])
@@ -237,24 +261,70 @@ def _sync_security_state():
             for item in application_rules
             if item.get("observed_rule")
         )
-        if verification_changed or prior_snapshot != current_snapshot:
-            error = "Windows Firewall configuration changed since the latest complete scan; fresh scanning is required."
+        if verification_changed or prior_snapshot != current_snapshot or profiles_changed:
+            error = (
+                "Windows Firewall profiles or rules changed since the latest complete scan; "
+                "fresh scanning is required."
+            )
             database.mark_latest_scan_stale(error)
             database.record_event(
                 "firewall_state_change",
                 error,
                 {"scan_id": latest["id"]},
             )
+        verification = latest.get("verification", {})
+        verification["firewall_profiles"] = profile_state
         risk = analyze_risk(
             latest["tcp"],
             latest["udp"],
             actual_rules,
             latest.get("processes", []),
+            profile_state,
+            database.list_url_scans(20),
         )
-        database.update_scan_security_state(latest["id"], risk, application_rules)
+        if profile_state.get("collection_status") != "verified":
+            error = profile_state.get("error") or "Live firewall profile status is unavailable."
+            database.mark_latest_scan_stale(error)
+        database.update_scan_security_state(latest["id"], risk, application_rules, verification)
         latest["risk"] = risk
         latest["firewall_rules"] = application_rules
-    return actual_rules, application_rules, latest
+        latest["firewall_profiles"] = profile_state
+        latest["verification"] = verification
+    return actual_rules, application_rules, latest, profile_state
+
+
+def _get_firewall_profile_state(force_store=False):
+    try:
+        state = manager.get_firewall_profiles()
+        state["verified_at"] = database.utc_now()
+    except (manager.FirewallError, OSError) as exc:
+        state = {
+            "collection_status": "error",
+            "verified_at": None,
+            "profiles": [],
+            "error": str(exc),
+        }
+    state["health"] = firewall_profile_health(state)
+    previous = database.get_latest_firewall_profile_snapshot()
+    should_store = force_store or not previous
+    if previous:
+        should_store = should_store or (
+            previous["collection_status"] != state["collection_status"]
+            or previous["profiles"] != state["profiles"]
+            or previous["error"] != state["error"]
+        )
+        try:
+            last_saved = datetime.fromisoformat(previous["verified_at"])
+            should_store = should_store or (
+                datetime.now(timezone.utc) - last_saved
+            ).total_seconds() >= 60
+        except (TypeError, ValueError):
+            should_store = True
+    if should_store:
+        database.save_firewall_profile_snapshot(
+            state["profiles"], state["collection_status"], state["error"]
+        )
+    return state
 
 
 def _latest_scope():
@@ -276,12 +346,21 @@ def _scan_and_save(source, scope):
     )
     processes = listening_processes()
     actual_rules, application_rules, _ = _actual_firewall_state()
-    risk = analyze_risk(state["tcp"], state["udp"], actual_rules, processes)
+    profile_state = _get_firewall_profile_state()
+    risk = analyze_risk(
+        state["tcp"],
+        state["udp"],
+        actual_rules,
+        processes,
+        profile_state,
+        database.list_url_scans(20),
+    )
     verification = {
         "nmap_tcp": "verified",
         "nmap_udp": "verified",
         "listener_inventory": "verified",
         "firewall_configuration": "observed",
+        "firewall_profiles": profile_state,
         "remote_accessibility": "not_tested",
         "loopback_only": True,
     }
@@ -295,22 +374,27 @@ def _scan_and_save(source, scope):
     scan_id = database.save_scan(
         result,
         source=source,
+        status="verified" if profile_state["collection_status"] == "verified" else "incomplete",
         scope=scope,
-        complete=True,
+        complete=profile_state["collection_status"] == "verified",
     )
     database.record_event(
         "scan",
-        f"Completed full-scope loopback TCP and UDP assessment ({len(scope['ports'])} ports).",
+        (
+            f"Completed full-scope loopback TCP and UDP assessment ({len(scope['ports'])} ports)."
+            if profile_state["collection_status"] == "verified"
+            else "Port scan completed, but firewall profile verification failed; assessment is incomplete."
+        ),
         {"scan_id": scan_id, "scope": scope, "verification": verification},
     )
     return {
         "id": scan_id,
         "created_at": database.utc_now(),
-        "status": "verified",
+        "status": "verified" if profile_state["collection_status"] == "verified" else "incomplete",
         "source": source,
         **result,
         "scope": scope,
-        "complete": True,
+        "complete": profile_state["collection_status"] == "verified",
     }
 
 
@@ -327,7 +411,9 @@ def _mark_failed_assessment(error, scan_id=None):
 
 
 def _current_scan_payload():
-    latest = database.get_latest_complete_scan() or database.get_latest_scan()
+    latest = database.get_latest_scan()
+    if latest and latest.get("status") != "incomplete":
+        latest = database.get_latest_complete_scan() or latest
     if not latest:
         return None
     if _current_assessment_status() == "stale":
@@ -444,7 +530,8 @@ def _comparison_payload(latest):
 @api.get("/state")
 def state():
     try:
-        _, application_rules, latest = _sync_security_state()
+        _, application_rules, latest, firewall_profiles = _sync_security_state()
+        current_scan = _current_scan_payload()
         try:
             monitoring = _monitor_snapshot()
             monitoring_error = None
@@ -453,15 +540,19 @@ def state():
             monitoring_error = str(exc)
         return jsonify(
             {
-                "latest_scan": _current_scan_payload(),
-                "latest_assessment_id": latest["id"] if latest else None,
+                "latest_scan": current_scan,
+                "latest_assessment_id": current_scan["id"] if current_scan else None,
                 "history": _scan_history(),
                 "events": database.list_events(20),
                 "firewall_rules": application_rules,
-                "process_inventory": _process_inventory_payload(_current_scan_payload()),
+                "process_inventory": _process_inventory_payload(current_scan),
                 "comparison": _comparison_payload(latest),
                 "monitoring": monitoring,
                 "monitoring_error": monitoring_error,
+                "port_monitoring": port_monitor_payload(),
+                "firewall_profiles": firewall_profiles,
+                "url_scans": database.list_url_scans(20),
+                "security_notifications": database.list_security_notifications(50),
                 "assessment_status": _current_assessment_status(),
                 "assessment_error": database.get_setting("latest_scan_error") or "",
                 "scope": latest.get("scope") if latest else None,
@@ -493,6 +584,110 @@ def state():
                 "assessment_error": str(exc),
             }
         ), 503
+
+
+@api.post("/url-scans")
+def scan_url():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _error("The URL scan request must be a JSON object.")
+    try:
+        analysis = analyze_url(data.get("url"))
+    except URLValidationError as exc:
+        return jsonify({"error": str(exc), "destination_type": "INVALID_URL"}), 422
+    try:
+        scan_id, created_at = database.save_url_scan(data["url"].strip(), analysis)
+        database.record_event(
+            "url_scan",
+            f"URL analysis #{scan_id} completed with {analysis['risk_level']} risk.",
+            {
+                "scan_id": scan_id,
+                "domain": analysis["domain"],
+                "risk_score": analysis["risk_score"],
+                "risk_level": analysis["risk_level"],
+            },
+        )
+        if analysis["risk_level"] in {"High", "Critical"}:
+            database.record_security_notification(
+                "medium",
+                "URL_HEURISTIC_FINDING",
+                f"URL heuristics found indicators in {analysis['domain']}; reputation remains unverified.",
+                {
+                    "scan_id": scan_id,
+                    "domain": analysis["domain"],
+                    "destination_type": analysis["destination_type"],
+                    "reason": "; ".join(
+                        finding["message"] for finding in analysis["findings"]
+                    ),
+                    "recommendation": analysis["recommended_action"],
+                    "reputation_status": analysis["threat_intelligence"]["status"],
+                },
+                f"url-scan:{scan_id}",
+            )
+    except sqlite3.Error as exc:
+        current_app.logger.exception("Could not save URL analysis")
+        return _error(f"Could not save URL analysis: {exc}", 503)
+    return jsonify({"id": scan_id, "created_at": created_at, **analysis}), 201
+
+
+@api.get("/url-scans")
+def url_scan_history():
+    try:
+        return jsonify(database.list_url_scans(100))
+    except (sqlite3.Error, ValueError) as exc:
+        return _error(f"Could not read URL analysis history: {exc}", 503)
+
+
+@api.get("/port-monitoring")
+def port_monitoring():
+    try:
+        return jsonify(port_monitor_payload())
+    except (sqlite3.Error, ValueError) as exc:
+        return _error(f"Could not read port monitoring state: {exc}", 503)
+
+
+@api.get("/port-monitoring/events")
+def port_monitoring_events():
+    try:
+        return jsonify(database.list_port_activity(200))
+    except (sqlite3.Error, ValueError) as exc:
+        return _error(f"Could not read port activity history: {exc}", 503)
+
+
+@api.get("/security-notifications")
+def security_notifications():
+    severity = request.args.get("severity", "").lower()
+    allowed = {"", "critical", "high", "medium", "info"}
+    if severity not in allowed:
+        return _error("severity must be critical, high, medium, or info.")
+    include_dismissed = request.args.get("include_dismissed") == "true"
+    try:
+        items = database.list_security_notifications(200)
+        if severity:
+            items = [item for item in items if item["severity"].lower() == severity]
+        if not include_dismissed:
+            items = [item for item in items if not item["dismissed"]]
+        return jsonify(items)
+    except (sqlite3.Error, ValueError) as exc:
+        return _error(f"Could not read security notifications: {exc}", 503)
+
+
+@api.post("/security-notifications/<int:notification_id>/dismiss")
+def dismiss_notification(notification_id):
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or data.get("confirmed") is not True:
+        return _error("Explicit confirmation is required to dismiss this notification.", 428)
+    try:
+        if not database.dismiss_security_notification(notification_id):
+            return _error("Security notification was not found.", 404)
+        database.record_event(
+            "notification_dismissed",
+            f"Dismissed security notification #{notification_id}; audit history was retained.",
+            {"notification_id": notification_id},
+        )
+        return jsonify({"dismissed": True, "notification_id": notification_id})
+    except sqlite3.Error as exc:
+        return _error(f"Could not dismiss security notification: {exc}", 503)
 
 
 @api.post("/scans")
@@ -624,7 +819,7 @@ def _duplicate_rule_response(rule, protocol, port):
 @api.get("/firewall/rules")
 def firewall_rules():
     try:
-        actual, records, _ = _sync_security_state()
+        actual, records, _, _ = _sync_security_state()
         return jsonify(
             {
                 "rules": records,
@@ -635,6 +830,113 @@ def firewall_rules():
         )
     except (manager.FirewallError, sqlite3.Error, ValueError) as exc:
         return _error(f"Could not verify the live firewall configuration: {exc}", 503)
+
+
+@api.post("/firewall/profiles/<profile_name>")
+def change_firewall_profile(profile_name):
+    profile = str(profile_name or "").title()
+    if profile not in {"Domain", "Private", "Public"}:
+        return _error("Profile must be Domain, Private, or Public.")
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or type(data.get("enabled")) is not bool:
+        return _error("The request must include a boolean enabled value.")
+    if data.get("confirmed") is not True:
+        return _error("Explicit confirmation is required before changing a firewall profile.", 428)
+    if not manager.is_admin():
+        return _error("Administrator privileges are required for firewall changes.", 403)
+
+    with _FIREWALL_PROFILE_LOCK:
+        try:
+            before = _get_firewall_profile_state()
+            if before.get("collection_status") != "verified":
+                raise manager.FirewallError(
+                    before.get("error") or "Current firewall profile state could not be verified."
+                )
+            current = next(
+                item for item in before["profiles"] if item.get("name") == profile
+            )
+            enabled = data["enabled"]
+            if not enabled and not any(
+                item.get("enabled") is True
+                for item in before["profiles"]
+                if item.get("name") != profile
+            ):
+                return _error(
+                    "This change would disable all Windows Firewall profiles; it is not allowed.",
+                    409,
+                )
+            changed = current["enabled"] is not enabled
+            if changed:
+                manager.set_firewall_profile(profile, enabled)
+            verified = _get_firewall_profile_state(force_store=True)
+            observed = next(
+                (
+                    item for item in verified.get("profiles", [])
+                    if item.get("name") == profile
+                ),
+                None,
+            )
+            if verified.get("collection_status") != "verified" or not observed or observed.get("enabled") is not enabled:
+                raise manager.FirewallError(
+                    "The requested profile state was not confirmed by a fresh Windows Firewall query. "
+                    "A policy restriction may have prevented the change."
+                )
+        except (manager.FirewallError, OSError, sqlite3.Error) as exc:
+            database.record_event(
+                "firewall_profile_change_failed",
+                f"Could not verify the requested {profile} Firewall profile change.",
+                {"profile": profile, "requested_enabled": data["enabled"], "error": str(exc)},
+            )
+            message = str(exc)
+            if "policy" in message.lower() or "group" in message.lower():
+                message += " Windows or organizational policy may control this setting."
+            return _error(message, 503)
+
+        message = (
+            f"Windows Firewall {profile} profile is verified "
+            f"{'enabled' if enabled else 'disabled'}."
+        )
+        database.record_event(
+            "firewall_profile_change",
+            message,
+            {
+                "profile": profile,
+                "enabled": enabled,
+                "changed": changed,
+                "verified_at": verified["verified_at"],
+                "administrator": True,
+            },
+        )
+        assessment = None
+        assessment_error = None
+        try:
+            assessment = _scan_and_save("firewall-profile-change", _latest_scope())
+        except (ScanError, manager.FirewallError, OSError, ValueError, psutil.Error, sqlite3.Error) as exc:
+            assessment_error = str(exc)
+            try:
+                _mark_failed_assessment(assessment_error)
+            except sqlite3.Error:
+                current_app.logger.exception("Could not persist failed post-firewall assessment")
+        return jsonify(
+            {
+                "verified": True,
+                "changed": changed,
+                "profile": observed,
+                "firewall_profiles": verified,
+                "assessment": assessment,
+                "assessment_status": (
+                    assessment.get("status", "incomplete") if assessment else "stale"
+                ),
+                "assessment_error": (
+                    assessment_error
+                    or (
+                        None
+                        if assessment and assessment.get("status") == "verified"
+                        else "Post-change assessment is incomplete because live firewall profile verification failed."
+                    )
+                ),
+            }
+        )
 
 
 @api.post("/firewall/rules")
@@ -651,7 +953,7 @@ def create_firewall_rule():
     if not manager.is_admin():
         return _error("Administrator privileges are required for firewall changes.", 403)
     try:
-        actual_rules, _, _ = _sync_security_state()
+        actual_rules, _, _, _ = _sync_security_state()
         existing = next(
             (rule for rule in actual_rules if manager.rule_covers_port(rule, protocol, port)),
             None,
@@ -765,7 +1067,7 @@ def remove_firewall_rule(rule_id):
 @api.get("/comparison")
 def comparison():
     try:
-        _, _, latest = _sync_security_state()
+        _, _, latest, _ = _sync_security_state()
         return jsonify(_comparison_payload(latest))
     except (manager.FirewallError, sqlite3.Error, ValueError) as exc:
         return _error(f"Comparison is unavailable because live verification failed: {exc}", 503)
@@ -833,5 +1135,5 @@ def _exposed(scan):
     return sorted(
         f"{item['protocol']}/{item['port']}"
         for item in scan.get("risk", {}).get("findings", [])
-        if not item.get("firewall_restricted")
+        if item.get("protocol") != "FIREWALL" and not item.get("firewall_restricted")
     )

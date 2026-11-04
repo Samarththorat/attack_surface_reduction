@@ -22,6 +22,7 @@ class RiskTests(unittest.TestCase):
             [{
                 "protocol": "TCP", "port": 3389, "enabled": True,
                 "direction": "Inbound", "action": "Block",
+                "profiles": "Any", "local_addresses": "Any", "remote_addresses": "Any",
             }],
         )
         self.assertEqual(risk["score"], 100)
@@ -39,11 +40,37 @@ class RiskTests(unittest.TestCase):
             {"protocol": "TCP", "port": 23, "enabled": True, "direction": "Outbound", "action": "Block"},
             {"protocol": "TCP", "port": 23, "enabled": True, "direction": "Inbound", "action": "Allow"},
             {"protocol": "UDP", "port": 23, "enabled": True, "direction": "Inbound", "action": "Block"},
+            {"protocol": "TCP", "port": 23, "enabled": True, "direction": "Inbound", "action": "Block"},
+            {"protocol": "TCP", "port": 23, "enabled": True, "direction": "Inbound", "action": "Block",
+             "profiles": "Public", "local_addresses": "Any", "remote_addresses": "Any"},
         ):
             with self.subTest(rule=rule):
                 result = analyze_risk(entries, [], [rule])
                 self.assertEqual(result["score"], 75)
                 self.assertFalse(result["findings"][0]["firewall_restricted"])
+
+    def test_unverified_url_heuristics_are_visible_but_not_double_counted_in_host_score(self):
+        result = analyze_risk(
+            [], [], [],
+            url_scans=[{
+                "id": 7,
+                "created_at": "2026-11-04T00:00:00+00:00",
+                "submitted_url": "http://127.0.0.1/",
+                "normalized_url": "http://127.0.0.1/",
+                "risk_score": 10,
+                "risk_level": "Low",
+                "analysis": {
+                    "destination_type": "LOOPBACK",
+                    "findings": [{"code": "NO_HTTPS"}],
+                    "threat_intelligence": {"status": "UNVERIFIED"},
+                },
+            }],
+        )
+        self.assertEqual(result["score"], 100)
+        observation = result["url_security_observations"]["scans"][0]
+        self.assertEqual(observation["destination_type"], "LOOPBACK")
+        self.assertEqual(observation["reputation_status"], "UNVERIFIED")
+        self.assertFalse(result["url_security_observations"]["deducted_from_host_score"])
 
 
 if __name__ == "__main__":

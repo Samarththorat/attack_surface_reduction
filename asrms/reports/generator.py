@@ -8,6 +8,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
 
 from asrms import database
+from asrms.monitoring.ports import port_monitor_payload
 from asrms.routes.api import _current_assessment_status, _scopes_compatible, _sync_security_state
 
 
@@ -22,13 +23,33 @@ FIREWALL_COLUMNS = [
 ]
 FINDING_COLUMNS = [
     "protocol", "port", "service", "severity", "firewall_restricted",
-    "service_state", "listeners", "recommendation",
+    "service_state", "listeners", "recommendation", "source", "profiles",
 ]
 EVENT_COLUMNS = ["id", "created_at", "category", "message", "details"]
+URL_SCAN_COLUMNS = [
+    "id", "created_at", "submitted_url", "normalized_url", "domain", "destination_type",
+    "risk_score", "risk_level", "risk_components", "reputation_status", "redirect_status",
+]
+URL_FINDING_COLUMNS = [
+    "scan_id", "domain", "risk_score", "risk_level", "code", "severity",
+    "points", "message",
+]
+FIREWALL_PROFILE_COLUMNS = [
+    "name", "enabled", "default_inbound_action", "default_outbound_action",
+    "collection_status", "verified_at",
+]
+NOTIFICATION_COLUMNS = ["id", "created_at", "severity", "category", "message", "details", "dismissed"]
+PORT_ACTIVITY_COLUMNS = ["id", "created_at", "event_type", "details"]
+PORT_LISTENER_COLUMNS = [
+    "protocol", "local_address", "port", "pid", "process_name", "executable",
+    "process_start_time", "first_detected_at", "last_detected_at", "state",
+    "firewall_restriction", "windows_service", "risk_indicators",
+]
+PDF_RECENT_EVENT_LIMIT = 25
 
 
 def _report_data():
-    actual_rules, application_rules, latest = _sync_security_state()
+    actual_rules, application_rules, latest, firewall_profiles = _sync_security_state()
     assessment_status = _current_assessment_status()
     stale = assessment_status == "stale" or (
         latest is not None and latest.get("status") == "stale"
@@ -45,6 +66,8 @@ def _report_data():
         and not stale
     )
     events = database.list_events(500)
+    url_scans = database.list_url_scans(500)
+    port_monitoring = port_monitor_payload()
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return {
         "scan": latest,
@@ -58,6 +81,11 @@ def _report_data():
         "actual_firewall_rules": actual_rules,
         "firewall_rules": application_rules,
         "events": events,
+        "firewall_profiles": firewall_profiles,
+        "url_scans": url_scans,
+        "port_monitoring": port_monitoring,
+        "port_activity": database.list_port_activity(500),
+        "security_notifications": database.list_security_notifications(500),
         "baseline": baseline,
         "baseline_compatible": compatible,
         "generated_at": generated_at,
@@ -157,6 +185,11 @@ def _summary_rows(data):
     scan = data["scan"]
     baseline = data["baseline"]
     risk = (scan or {}).get("risk", {})
+    firewall_health = risk.get("firewall_health") or (
+        (data.get("firewall_profiles") or {}).get("health", {})
+    )
+    latest_url = (data.get("url_scans") or [None])[0]
+    port_summary = data.get("port_monitoring", {}).get("summary", {})
     return [
         {"field": "Report generated (UTC)", "value": data["generated_at"]},
         {"field": "Latest complete scan ID", "value": scan["id"] if scan else "Unavailable"},
@@ -167,7 +200,18 @@ def _summary_rows(data):
         {"field": "Scan scope", "value": json.dumps(data["scope"], separators=(",", ":"))},
         {"field": "Remote accessibility tested", "value": "No"},
         {"field": "Security score", "value": risk.get("score", "Unavailable")},
+        {"field": "Score deductions", "value": json.dumps(risk.get("score_deductions", []), separators=(",", ":"))},
         {"field": "Exposed open ports", "value": risk.get("exposed_ports", "Unavailable")},
+        {"field": "Firewall health", "value": firewall_health.get("status", "Unknown")},
+        {"field": "Firewall profiles enabled", "value": firewall_health.get("enabled_count", "Unknown")},
+        {"field": "Firewall profiles disabled", "value": firewall_health.get("disabled_count", "Unknown")},
+        {"field": "Firewall profile verification time", "value": (data.get("firewall_profiles") or {}).get("verified_at", "Unavailable")},
+        {"field": "Firewall profile collection status", "value": (data.get("firewall_profiles") or {}).get("collection_status", "Unavailable")},
+        {"field": "Active TCP listeners", "value": port_summary.get("tcp_listeners", "Unavailable")},
+        {"field": "Relevant UDP sockets", "value": port_summary.get("udp_sockets", "Unavailable")},
+        {"field": "Port monitoring status", "value": data.get("port_monitoring", {}).get("status", "Unavailable")},
+        {"field": "Latest URL risk", "value": f"{latest_url['risk_level']} ({latest_url['risk_score']}/100)" if latest_url else "Unavailable"},
+        {"field": "Latest URL reputation", "value": latest_url["analysis"]["threat_intelligence"]["status"] if latest_url else "Unavailable"},
         {"field": "Baseline scan ID", "value": baseline["id"] if baseline else "Unavailable"},
         {"field": "Baseline timestamp", "value": baseline["created_at"] if baseline else "Unavailable"},
         {"field": "Baseline scope compatible", "value": data["baseline_compatible"]},
@@ -205,6 +249,85 @@ def excel_report():
         _write_sheet(writer, _rows_for_scan(scan), PORT_COLUMNS, "Port Observations")
         _write_sheet(writer, _process_rows(scan), PROCESS_COLUMNS, "Processes")
         _write_sheet(writer, _firewall_rows(data), FIREWALL_COLUMNS, "Firewall Status")
+        _write_sheet(
+            writer,
+            [
+                {
+                    **item,
+                    "collection_status": data["firewall_profiles"].get("collection_status"),
+                    "verified_at": data["firewall_profiles"].get("verified_at"),
+                }
+                for item in data["firewall_profiles"].get("profiles", [])
+            ] if data["firewall_profiles"] else [],
+            FIREWALL_PROFILE_COLUMNS,
+            "Firewall Profiles",
+        )
+        url_rows = [
+            {
+                key: item.get(key, "")
+                for key in ("id", "created_at", "submitted_url", "normalized_url", "domain", "risk_score", "risk_level")
+            }
+            | {
+                "destination_type": item.get("analysis", {}).get("destination_type", "UNKNOWN"),
+                "risk_components": json.dumps(
+                    item.get("analysis", {}).get("risk_components", {}),
+                    separators=(",", ":"),
+                ),
+                "reputation_status": item.get("analysis", {}).get("threat_intelligence", {}).get("status", "UNVERIFIED"),
+                "redirect_status": item.get("analysis", {}).get("redirect_chain", {}).get("status", "NOT_CHECKED"),
+            }
+            for item in data["url_scans"]
+        ]
+        _write_sheet(writer, url_rows, URL_SCAN_COLUMNS, "URL Assessments")
+        url_finding_rows = [
+            {
+                "scan_id": item["id"],
+                "domain": item["domain"],
+                "risk_score": item["risk_score"],
+                "risk_level": item["risk_level"],
+                **finding,
+            }
+            for item in data["url_scans"]
+            for finding in item["analysis"].get("findings", [])
+        ]
+        _write_sheet(writer, url_finding_rows, URL_FINDING_COLUMNS, "URL Findings")
+        listeners = (
+            data["port_monitoring"].get("listeners", [])
+            if data["port_monitoring"].get("status") == "verified"
+            else []
+        )
+        listener_rows = [
+            {
+                **{
+                    key: item.get(key, "")
+                    for key in PORT_LISTENER_COLUMNS
+                    if key != "risk_indicators"
+                },
+                "risk_indicators": "; ".join(item.get("risk_indicators", [])),
+            }
+            for item in listeners
+        ]
+        _write_sheet(writer, listener_rows, PORT_LISTENER_COLUMNS, "Live Listeners")
+        for protocol, sheet_name in (("TCP", "TCP Listeners"), ("UDP", "UDP Sockets")):
+            _write_sheet(
+                writer,
+                [row for row in listener_rows if row["protocol"] == protocol],
+                PORT_LISTENER_COLUMNS,
+                sheet_name,
+            )
+        port_activity_rows = [
+            {**event, "details": json.dumps(event.get("details", {}), separators=(",", ":"))}
+            for event in data["port_activity"]
+        ]
+        _write_sheet(writer, port_activity_rows, PORT_ACTIVITY_COLUMNS, "Port Activity")
+        notification_rows = [
+            {
+                **item,
+                "details": json.dumps(item.get("details", {}), separators=(",", ":")),
+            }
+            for item in data["security_notifications"]
+        ]
+        _write_sheet(writer, notification_rows, NOTIFICATION_COLUMNS, "Security Notifications")
         findings = (scan or {}).get("risk", {}).get("findings", [])
         finding_rows = [
             {
@@ -302,7 +425,7 @@ def _pdf_table(pdf, title, rows, columns, generated_at, stale_notice=None):
                 cell.get_text().set_weight("bold")
             elif row_index % 2:
                 cell.set_facecolor("#edf2f7")
-        pdf.savefig(figure, bbox_inches="tight")
+        pdf.savefig(figure)
 
 
 def pdf_report():
@@ -350,6 +473,123 @@ def pdf_report():
         )
         _pdf_table(
             pdf,
+            "Windows Firewall Profiles",
+            [
+                {
+                    **item,
+                    "collection_status": data["firewall_profiles"].get("collection_status"),
+                    "verified_at": data["firewall_profiles"].get("verified_at"),
+                }
+                for item in data["firewall_profiles"].get("profiles", [])
+            ] if data["firewall_profiles"] else [],
+            FIREWALL_PROFILE_COLUMNS,
+            data["generated_at"],
+            stale_notice,
+        )
+        url_rows = [
+            {
+                "created_at": item["created_at"],
+                "domain": item["domain"],
+                "destination": item["analysis"].get("destination_type", "UNKNOWN"),
+                "risk_components": json.dumps(
+                    item["analysis"].get("risk_components", {}),
+                    separators=(",", ":"),
+                ),
+                "risk_score": item["risk_score"],
+                "risk_level": item["risk_level"],
+                "reputation_status": item["analysis"]["threat_intelligence"]["status"],
+                "redirect_status": item["analysis"]["redirect_chain"]["status"],
+                "findings": "; ".join(
+                    finding["message"] for finding in item["analysis"]["findings"]
+                ),
+            }
+            for item in data["url_scans"]
+        ]
+        _pdf_table(
+            pdf,
+            "URL Security Assessments",
+            url_rows,
+            ["created_at", "domain", "destination", "risk_score", "risk_level", "risk_components", "reputation_status", "redirect_status", "findings"],
+            data["generated_at"],
+            stale_notice,
+        )
+        url_finding_rows = [
+            {
+                "scan_id": item["id"],
+                "domain": item["domain"],
+                "risk": f"{item['risk_level']} ({item['risk_score']}/100)",
+                "code": finding["code"],
+                "severity": finding["severity"],
+                "points": finding["points"],
+                "finding": finding["message"],
+            }
+            for item in data["url_scans"]
+            for finding in item["analysis"].get("findings", [])
+        ]
+        _pdf_table(
+            pdf,
+            "URL Security Findings",
+            url_finding_rows,
+            ["scan_id", "domain", "risk", "code", "severity", "points", "finding"],
+            data["generated_at"],
+            stale_notice,
+        )
+        listeners = (
+            data["port_monitoring"].get("listeners", [])
+            if data["port_monitoring"].get("status") == "verified"
+            else []
+        )
+        _pdf_table(
+            pdf,
+            "Current TCP Listeners",
+            [item for item in listeners if item.get("protocol") == "TCP"],
+            PORT_LISTENER_COLUMNS,
+            data["generated_at"],
+            stale_notice,
+        )
+        _pdf_table(
+            pdf,
+            "Current UDP-Bound Sockets",
+            [item for item in listeners if item.get("protocol") == "UDP"],
+            PORT_LISTENER_COLUMNS,
+            data["generated_at"],
+            stale_notice,
+        )
+        _pdf_table(
+            pdf,
+            f"Current Listeners ({data['port_monitoring'].get('status', 'unavailable')})",
+            listeners,
+            PORT_LISTENER_COLUMNS,
+            data["generated_at"],
+            stale_notice,
+        )
+        _pdf_table(
+            pdf,
+            f"Recent Continuous Port Activity (up to {PDF_RECENT_EVENT_LIMIT})",
+            [
+                {**event, "details": json.dumps(event.get("details", {}), separators=(",", ":"))}
+                for event in data["port_activity"][:PDF_RECENT_EVENT_LIMIT]
+            ],
+            PORT_ACTIVITY_COLUMNS,
+            data["generated_at"],
+            stale_notice,
+        )
+        _pdf_table(
+            pdf,
+            f"Recent Security Notifications (up to {PDF_RECENT_EVENT_LIMIT})",
+            [
+                {
+                    **item,
+                    "details": json.dumps(item.get("details", {}), separators=(",", ":")),
+                }
+                for item in data["security_notifications"][:PDF_RECENT_EVENT_LIMIT]
+            ],
+            NOTIFICATION_COLUMNS,
+            data["generated_at"],
+            stale_notice,
+        )
+        _pdf_table(
+            pdf,
             "Risk Findings",
             (scan or {}).get("risk", {}).get("findings", []),
             ["protocol", "port", "service", "severity", "firewall_restricted", "service_state", "recommendation"],
@@ -372,10 +612,10 @@ def pdf_report():
         _pdf_table(pdf, "Before and After Comparison", comparison, ["field", "value"], data["generated_at"], stale_notice)
         _pdf_table(
             pdf,
-            "Audit Events",
+            f"Recent Audit Events (up to {PDF_RECENT_EVENT_LIMIT})",
             [
                 {**event, "details": json.dumps(event.get("details", {}), separators=(",", ":"))}
-                for event in data["events"]
+                for event in data["events"][:PDF_RECENT_EVENT_LIMIT]
             ],
             ["id", "created_at", "category", "message", "details"],
             data["generated_at"],

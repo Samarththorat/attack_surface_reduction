@@ -48,6 +48,8 @@ APP_RULE = {
     "protocol": "TCP",
     "port": "8090",
     "profiles": "Any",
+    "local_addresses": "Any",
+    "remote_addresses": "Any",
 }
 
 
@@ -84,9 +86,28 @@ class ApplicationTests(unittest.TestCase):
             "asrms.routes.api.manager.list_inbound_block_rules", return_value=[]
         )
         self.firewall_snapshot.start()
+        self.firewall_profiles = patch(
+            "asrms.routes.api.manager.get_firewall_profiles",
+            return_value={
+                "collection_status": "verified",
+                "verified_at": "2026-11-04T00:00:00+00:00",
+                "profiles": [
+                    {
+                        "name": name,
+                        "enabled": True,
+                        "default_inbound_action": "Block",
+                        "default_outbound_action": "Allow",
+                    }
+                    for name in ("Domain", "Private", "Public")
+                ],
+                "error": None,
+            },
+        )
+        self.firewall_profiles.start()
 
     def tearDown(self):
         self.firewall_snapshot.stop()
+        self.firewall_profiles.stop()
         self.temp.cleanup()
 
     def post(self, path, **kwargs):
@@ -472,6 +493,27 @@ class ApplicationTests(unittest.TestCase):
         self.assertIn("stale", assessment.loc[assessment["field"] == "Assessment status", "value"].iloc[0])
         self.assertEqual(pdf.status_code, 200)
         self.assertIn(b"stale", pdf.data.lower())
+
+    def test_pdf_report_has_valid_download_response(self):
+        response = self.client.get("/api/reports/pdf")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "application/pdf")
+        self.assertIn(
+            'attachment; filename=asrms-security-report.pdf',
+            response.headers["Content-Disposition"],
+        )
+        self.assertGreater(len(response.data), 0)
+        self.assertTrue(response.data.startswith(b"%PDF-"))
+        self.assertIn(b"%%EOF", response.data[-2048:])
+
+    @patch("asrms.routes.reports.pdf_report", side_effect=OSError("PDF renderer failed"))
+    def test_pdf_generation_failure_returns_error_instead_of_download(self, _pdf_report):
+        response = self.client.get("/api/reports/pdf")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json["error"],
+            "Report generation failed: PDF renderer failed",
+        )
 
     @patch("asrms.routes.api.listening_processes", return_value=PROCESSES)
     @patch("asrms.routes.api.scan_local_ports", side_effect=ScanError("Nmap timed out"))

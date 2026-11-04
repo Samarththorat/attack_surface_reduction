@@ -53,6 +53,7 @@ class NmapTests(unittest.TestCase):
             self.assertIn("-sV", command)
             self.assertIn("--version-light", command)
             self.assertIn("--version-timeout", command)
+            self.assertIn("70s", command)
 
     def test_rejects_non_local_or_invalid_scan_input(self):
         for ports in ([], [0], [65536], [True], [80, 80], list(range(1, 102))):

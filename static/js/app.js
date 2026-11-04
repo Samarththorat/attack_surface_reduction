@@ -4,6 +4,10 @@
   const $ = (id) => document.getElementById(id);
   let chart;
   const csrf = document.querySelector('meta[name="asrms-csrf"]')?.content || "";
+  let analyzedUrlToOpen = null;
+  let isAdministrator = false;
+  let securityNotifications = [];
+  const reportDownloads = new Set();
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   })[char]);
@@ -47,15 +51,97 @@
     setTimeout(() => el.remove(), 6000);
   }
 
+  function reportFilename(response, fallback) {
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const encoded = disposition.match(/filename\*\s*=\s*UTF-8''([^;]+)/i);
+    const regular = disposition.match(/filename\s*=\s*(?:"([^"]+)"|([^;]+))/i);
+    let filename = fallback;
+    if (encoded) {
+      try { filename = decodeURIComponent(encoded[1]); }
+      catch { filename = encoded[1]; }
+    } else if (regular) {
+      filename = (regular[1] || regular[2]).trim();
+    }
+    return filename
+      .split(/[\\/]/)
+      .pop()
+      .replace(/[<>:"|?*\x00-\x1f]/g, "_") || fallback;
+  }
+
+  function bindReportDownloads() {
+    document.querySelectorAll("[data-report-download]").forEach((link) => {
+      link.addEventListener("click", async (event) => {
+        event.preventDefault();
+        const format = link.dataset.reportDownload;
+        const expectedTypes = {
+          pdf: "application/pdf",
+          excel: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        };
+        const expectedType = expectedTypes[format];
+        const endpoint = new URL(link.href, window.location.href);
+        const downloadKey = endpoint.href;
+        if (reportDownloads.has(downloadKey) || link.getAttribute("aria-disabled") === "true") return;
+        reportDownloads.add(downloadKey);
+        const matchingLinks = [...document.querySelectorAll("[data-report-download]")]
+          .filter((item) => item.href === downloadKey);
+        matchingLinks.forEach((item) => {
+          item.setAttribute("aria-disabled", "true");
+          item.setAttribute("aria-busy", "true");
+          item.classList.add("disabled");
+        });
+        setStatus(`Preparing ${format.toUpperCase()} report…`);
+        try {
+          if (!expectedType || endpoint.origin !== window.location.origin ||
+              endpoint.pathname !== `/api/reports/${format}`) {
+            throw new Error("Invalid report download link.");
+          }
+          const response = await fetch(endpoint.href, { credentials: "same-origin" });
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            throw new Error(body.error || `Report download failed (${response.status}).`);
+          }
+          const contentType = (response.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+          if (contentType !== expectedType) {
+            throw new Error(`The server returned an unexpected report type: ${contentType || "unknown"}.`);
+          }
+          const blob = await response.blob();
+          if (!blob.size) throw new Error("The generated report is empty.");
+          const filename = reportFilename(response, `asrms-security-report.${format === "excel" ? "xlsx" : "pdf"}`);
+          const objectUrl = URL.createObjectURL(blob);
+          const downloadLink = document.createElement("a");
+          downloadLink.href = objectUrl;
+          downloadLink.download = filename;
+          downloadLink.hidden = true;
+          document.body.appendChild(downloadLink);
+          try { downloadLink.click(); }
+          finally {
+            downloadLink.remove();
+            window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+          }
+          setStatus(`Report download started: ${filename}.`, "success");
+        } catch (error) {
+          setStatus(`Could not download report: ${error.message}`, "error");
+        } finally {
+          reportDownloads.delete(downloadKey);
+          matchingLinks.forEach((item) => {
+            item.removeAttribute("aria-disabled");
+            item.removeAttribute("aria-busy");
+            item.classList.remove("disabled");
+          });
+        }
+      });
+    });
+  }
+
   function allPorts(scan) {
     return scan ? [...(scan.tcp || []), ...(scan.udp || [])] : [];
   }
 
   function processFor(processes, protocol, port) {
-    return (processes || [])
+    const processNames = (processes || [])
       .filter((item) => item.protocol === protocol && item.port === port)
-      .flatMap((item) => (item.processes || []).map((proc) => `${proc.name} (${proc.pid ?? "PID unavailable"})`))
-      .join(", ") || "—";
+      .flatMap((item) => (item.processes || []).map((proc) => `${proc.name} (${proc.pid ?? "PID unavailable"})`));
+    return [...new Set(processNames)].join(", ") || "—";
   }
 
   function renderScan(scan) {
@@ -131,7 +217,12 @@
     if (table) {
       table.innerHTML = stale
         ? `<tr><td colspan="7" class="empty-state">Findings from scan #${esc(scanId)} are stale and are not displayed as current. Run a complete assessment.</td></tr>`
-        : findings.length ? findings.map((item) => `<tr><td><span class="severity ${severityClass(item.severity)}">${esc(item.severity)}</span></td><td>${esc(item.protocol)}/${item.port}</td><td>${esc(item.service)}</td><td>${item.firewall_restricted ? '<span class="state-badge state-closed">LIVE RULE VERIFIED</span>' : '<span class="state-badge state-open">EXPOSED</span>'}</td><td>${esc(item.service_state || "unknown")}<small class="table-subtext">${item.listeners?.length ? esc(item.listeners.map((listener) => listener.local_address).join(", ")) : "No matching listener mapped"}</small></td><td>${esc(item.recommendation)}</td><td>${item.firewall_restricted ? "—" : `<button class="btn btn-sm btn-outline-light restrict-button" data-protocol="${esc(item.protocol)}" data-port="${item.port}">Restrict</button>`}</td></tr>`).join("") : '<tr><td colspan="7" class="empty-state">No open ports in the latest assessment. This is not a vulnerability guarantee.</td></tr>';
+        : findings.length ? findings.map((item) => {
+          const firewallFinding = item.protocol === "FIREWALL";
+          const subject = firewallFinding ? "Windows Firewall profiles" : `${item.protocol}/${item.port}`;
+          const status = firewallFinding ? "PROFILE HEALTH" : item.firewall_restricted ? "LIVE RULE VERIFIED" : "EXPOSED";
+          return `<tr><td><span class="severity ${severityClass(item.severity)}">${esc(item.severity)}</span></td><td>${esc(subject)}</td><td>${esc(item.service)}</td><td>${item.firewall_restricted ? '<span class="state-badge state-closed">LIVE RULE VERIFIED</span>' : `<span class="state-badge ${firewallFinding ? "state-open" : "state-open"}">${status}</span>`}</td><td>${esc(item.service_state || "unknown")}<small class="table-subtext">${item.listeners?.length ? esc(item.listeners.map((listener) => listener.local_address).join(", ")) : firewallFinding ? esc((item.profiles || []).join(", ") || "Profile verification") : "No matching listener mapped"}</small></td><td>${esc(item.recommendation)}</td><td>${firewallFinding || item.firewall_restricted ? "—" : `<button class="btn btn-sm btn-outline-light restrict-button" data-protocol="${esc(item.protocol)}" data-port="${item.port}">Restrict</button>`}</td></tr>`;
+        }).join("") : '<tr><td colspan="7" class="empty-state">No open ports in the latest assessment. This is not a vulnerability guarantee.</td></tr>';
     }
     const summary = $("riskSummary");
     if (summary) {
@@ -154,15 +245,24 @@
     }
   }
 
-  function renderOverview(scan, rules, stale) {
+  function renderRiskUrlContext(observations) {
+    const target = $("urlRiskContext");
+    if (!target) return;
+    const scans = observations?.scans || [];
+    target.innerHTML = scans.length ? scans.slice(0, 10).map((item) => `<div class="event-row"><span class="event-marker"></span><div><strong>Scan #${esc(item.scan_id)} · ${esc(item.destination_type)} · ${esc(item.risk_level)} heuristic risk (${esc(item.risk_score)}/100)</strong><small>${esc(fmtTime(item.created_at))} · Reputation ${esc(item.reputation_status)} · ${esc(item.findings.join(", ") || "No indicators")}</small><p>${esc(item.submitted_url)}</p><p><strong>Scoring:</strong> Not deducted from host exposure. ${esc(observations.reason || "URL reputation remains unverified.")}</p></div></div>`).join("") : '<div class="empty-state">No recent URL assessments.</div>';
+  }
+
+  function renderOverview(scan, rules, stale, firewallProfiles, portMonitoring) {
     if (!scan) return;
     const risk = scan.risk || {};
     if ($("scoreValue")) $("scoreValue").textContent = risk.score ?? "--";
     if ($("scoreBar")) $("scoreBar").style.width = `${risk.score ?? 0}%`;
-    if ($("scoreLabel")) $("scoreLabel").textContent = stale ? "Last verified (stale)" : risk.score >= 80 ? "Good" : risk.score >= 60 ? "Needs attention" : "Action recommended";
+    if ($("scoreLabel")) $("scoreLabel").textContent = risk.score === null || risk.score === undefined ? "Assessment incomplete" : stale ? "Last verified (stale)" : risk.score >= 80 ? "Good" : risk.score >= 60 ? "Needs attention" : "Action recommended";
     if ($("exposedCount")) $("exposedCount").textContent = risk.exposed_ports ?? 0;
     if ($("highRiskCount")) $("highRiskCount").textContent = (risk.critical || 0) + (risk.high || 0);
     if ($("firewallCount")) $("firewallCount").textContent = rules.filter((item) => item.verified && item.enabled && !item.removed_at).length;
+    renderFirewallProfiles(firewallProfiles, risk.firewall_health);
+    if ($("activeListenerCount")) $("activeListenerCount").textContent = portMonitoring?.summary?.tcp_listeners ?? "--";
     renderRisks(risk, stale, scan.id);
     const banner = $("statusBanner");
     if (banner) {
@@ -264,7 +364,7 @@
     set("restrictedCount", data.compatible ? data.restricted_ports.length : "—");
     set("scoreImprovement", !data.compatible || data.score_improvement === null ? "—" : `${data.score_improvement > 0 ? "+" : ""}${data.score_improvement}`);
     set("reductionPercent", !data.compatible || data.attack_surface_reduction_percent === null ? "Not comparable" : `${data.attack_surface_reduction_percent}%`);
-    const tags = (id, items) => { if ($(id)) $(id).innerHTML = items?.length ? items.map((item) => `<span class="port-tag">${esc(typeof item === "string" ? item : `${item.protocol}/${item.port} ${item.severity}`)}</span>`).join("") : '<span class="port-tag empty">None recorded</span>'; };
+    const tags = (id, items) => { if ($(id)) $(id).innerHTML = items?.length ? items.map((item) => `<span class="port-tag">${esc(typeof item === "string" ? item : item.protocol === "FIREWALL" ? `${item.service} ${item.severity}` : `${item.protocol}/${item.port} ${item.severity}`)}</span>`).join("") : '<span class="port-tag empty">None recorded</span>'; };
     tags("initiallyExposed", data.compatible ? data.initially_exposed : []);
     tags("currentlyExposed", data.compatible ? data.currently_exposed : []);
     tags("restrictedPorts", data.compatible ? data.restricted_ports : []);
@@ -281,6 +381,168 @@
     if ($("processCount")) $("processCount").textContent = value.process_count ?? "--";
   }
 
+  function renderFirewallProfiles(value, health) {
+    const profiles = value?.profiles || [];
+    const known = value?.collection_status === "verified" && profiles.length === 3;
+    const effectiveHealth = known ? (health?.status || value?.health?.status || "Unknown") : "Unknown";
+    const summary = $("firewallProfileSummary");
+    if (summary) {
+      summary.textContent = known
+        ? profiles.map((item) => `${item.name}: ${item.enabled ? "Enabled" : "Disabled"}`).join(" · ")
+        : `Unknown · ${value?.error || "Live firewall profile status is unavailable."}`;
+    }
+    const policy = $("firewallPolicySummary");
+    if (policy) {
+      policy.textContent = known
+        ? `Default inbound: ${profiles.map((item) => `${item.name} ${item.default_inbound_action}`).join(" · ")} | Default outbound: ${profiles.map((item) => `${item.name} ${item.default_outbound_action}`).join(" · ")} | Last verified: ${fmtTime(value.verified_at)}`
+        : `Collection status: ${value?.collection_status || "unavailable"} · ${value?.error || "Protection is not assumed."}`;
+    }
+    if ($("firewallHealthValue")) $("firewallHealthValue").textContent = effectiveHealth;
+    if ($("firewallProfilesNote")) {
+      $("firewallProfilesNote").textContent = known
+        ? `${health?.enabled_count ?? value?.health?.enabled_count ?? profiles.filter((item) => item.enabled).length}/3 profiles enabled`
+        : "Live profiles not verified";
+    }
+    if ($("firewallHealthBadge")) {
+      $("firewallHealthBadge").textContent = effectiveHealth;
+      $("firewallHealthBadge").className = `state-badge ${effectiveHealth === "Healthy" ? "state-closed" : "state-open"}`;
+    }
+    const cards = $("firewallProfileCards");
+    if (cards) {
+      cards.innerHTML = known ? profiles.map((item) => {
+        const enabled = item.enabled === true;
+        const action = enabled ? "Disable" : "Enable";
+        return `<article class="profile-card"><div><strong>${esc(item.name)} profile</strong><span class="state-badge ${enabled ? "state-closed" : "state-open"}">${enabled ? "Enabled" : "Disabled"}</span></div><p>Inbound: ${esc(item.default_inbound_action)} · Outbound: ${esc(item.default_outbound_action)}</p><p>Last verified: ${esc(fmtTime(value.verified_at))}</p><button class="btn ${enabled ? "btn-danger" : "btn-primary"} profile-action" data-profile="${esc(item.name)}" data-enabled="${enabled ? "false" : "true"}" ${isAdministrator ? "" : "disabled"}>${action} Firewall</button></article>`;
+      }).join("") : '<div class="empty-state">Profile controls are unavailable until live status is verified.</div>';
+      cards.querySelectorAll(".profile-action").forEach((button) => button.addEventListener("click", () => changeFirewallProfile(button.dataset.profile, button.dataset.enabled === "true")));
+    }
+  }
+
+  async function changeFirewallProfile(profile, enabled) {
+    const explanation = enabled
+      ? `Enable the ${profile} Windows Firewall profile? Windows Firewall will apply its current rules to this network profile. Administrator permissions are required; Group Policy may prevent changes.`
+      : `WARNING: Disable the ${profile} Windows Firewall profile? This removes firewall filtering for this profile and can expose local services. Administrator permissions are required; Group Policy may prevent changes.`;
+    if (!window.confirm(explanation)) return;
+    setStatus(`${enabled ? "Enabling" : "Disabling"} ${profile} profile; verifying actual Windows Firewall state and refreshing the assessment…`);
+    try {
+      const result = await getJson(`/api/firewall/profiles/${encodeURIComponent(profile)}`, {
+        method: "POST",
+        body: JSON.stringify({ enabled, confirmed: true })
+      });
+      await refresh();
+      const assessmentMessage = result.assessment_status === "verified"
+        ? `Assessment #${result.assessment.id} refreshed.`
+        : `Assessment refresh failed and is stale: ${result.assessment_error || "unknown error"}`;
+      setStatus(`Windows Firewall ${profile} profile ${enabled ? "enabled" : "disabled"} and verified. ${assessmentMessage}`, result.assessment_status === "verified" ? "success" : "warning");
+    } catch (error) {
+      await refresh();
+      setStatus(`${error.message}${error.message.toLowerCase().includes("administrator") ? " Administrator Required." : ""}`, "error");
+    }
+  }
+
+  function renderSecurityNotifications(notifications) {
+    securityNotifications = notifications || [];
+    const target = $("securityAlerts");
+    const filter = $("notificationFilter")?.value || "all";
+    if (!target) return;
+    const active = securityNotifications.filter((item) => !item.dismissed);
+    const visible = filter === "all" ? active : active.filter((item) => String(item.severity).toLowerCase() === filter);
+    target.innerHTML = visible.length ? visible.map((item) => {
+      const details = item.details || {};
+      const fields = [
+        details.event_type,
+        details.protocol ? `${details.protocol}/${details.port ?? "?"}` : null,
+        details.process_name ? `${details.process_name} (PID ${details.pid ?? "unavailable"})` : null,
+        details.executable
+      ].filter(Boolean).map(esc).join(" · ");
+      return `<article class="event-row notification-row"><span class="event-marker ${["critical", "high"].includes(String(item.severity).toLowerCase()) ? "error" : ""}"></span><div><strong><span class="severity ${severityClass(item.severity)}">${esc(item.severity)}</span> ${esc(item.message)}</strong><small>${esc(fmtTime(item.created_at))}${fields ? ` · ${fields}` : ""}</small><p>${esc(details.reason || "No additional reason was recorded.")}</p><p><strong>Recommended:</strong> ${esc(details.recommendation || "Review the detailed event history.")}</p></div><button class="btn btn-sm btn-outline-light dismiss-notification" data-id="${esc(item.id)}" aria-label="Dismiss notification">Dismiss</button></article>`;
+    }).join("") : '<div class="empty-state">No active notifications match this filter.</div>';
+    target.querySelectorAll(".dismiss-notification").forEach((button) => button.addEventListener("click", () => dismissNotification(button.dataset.id)));
+  }
+
+  async function dismissNotification(id) {
+    try {
+      await getJson(`/api/security-notifications/${encodeURIComponent(id)}/dismiss`, {
+        method: "POST",
+        body: JSON.stringify({ confirmed: true })
+      });
+      await refresh();
+    } catch (error) {
+      setStatus(`Could not dismiss notification: ${error.message}`, "error");
+    }
+  }
+
+  function renderPortMonitoring(value) {
+    const summary = value?.summary || {};
+    if ($("tcpListenerCount")) $("tcpListenerCount").textContent = summary.tcp_listeners ?? "--";
+    if ($("udpSocketCount")) $("udpSocketCount").textContent = summary.udp_sockets ?? "--";
+    if ($("persistentListenerCount")) $("persistentListenerCount").textContent = summary.persistent_tcp_listeners ?? "--";
+    if ($("recentlyClosedCount")) $("recentlyClosedCount").textContent = summary.recently_closed_tcp_listeners ?? "--";
+    if ($("newTcpCount")) $("newTcpCount").textContent = summary.new_tcp_listeners ?? "--";
+    if ($("newUdpCount")) $("newUdpCount").textContent = summary.new_udp_sockets ?? "--";
+    if ($("removedUdpCount")) $("removedUdpCount").textContent = summary.recently_removed_udp_sockets ?? "--";
+    if ($("portMonitorUpdated")) $("portMonitorUpdated").textContent = `Last updated ${fmtTime(value?.last_updated)}`;
+    const status = $("portMonitorStatus");
+    if (status) {
+      status.textContent = value?.status === "verified"
+        ? `Monitoring ${summary.tcp_listeners ?? 0} TCP listeners and ${summary.udp_sockets ?? 0} UDP sockets.`
+        : `Port inventory ${value?.status || "unavailable"}. ${value?.error || "Waiting for a successful socket snapshot."}`;
+      status.classList.toggle("warning", value?.status !== "verified");
+    }
+    const body = $("portMonitorTable");
+    if (body) {
+      const listeners = value?.status === "verified" ? (value.listeners || []) : [];
+      body.innerHTML = value?.status !== "verified"
+        ? `<tr><td colspan="11" class="empty-state">Listener inventory is ${esc(value?.status || "unavailable")}; retained socket rows are not presented as current. ${esc(value?.error || "")}</td></tr>`
+        : listeners.length ? listeners.map((item) => `<tr><td>${esc(item.protocol)}</td><td>${esc(item.local_address)}</td><td>${esc(item.port)}</td><td>${esc(item.pid ?? "—")}</td><td>${esc(item.process_name)}</td><td class="text-break">${esc(item.executable)}</td><td>${esc(fmtTime(item.process_start_time))}</td><td>${esc(fmtTime(item.first_detected_at))}</td><td>${esc(fmtTime(item.last_detected_at))}</td><td>${esc(item.state)}<small class="table-subtext">${esc(item.firewall_restriction)} · ${item.persistence_seconds ?? 0}s persistence${item.risk_indicators?.length ? ` · ${esc(item.risk_indicators.join(" "))}` : ""}</small></td><td>${esc(item.windows_service)}</td></tr>`).join("")
+        : '<tr><td colspan="11" class="empty-state">No listening TCP ports or relevant UDP sockets detected.</td></tr>';
+    }
+    const events = $("portActivityList");
+    if (events) {
+      const items = value?.events || [];
+      events.innerHTML = items.length ? items.map((item) => `<div class="event-row"><span class="event-marker ${["HIGH", "CRITICAL"].includes(item.details?.severity) || item.event_type.includes("FAILED") ? "error" : ""}"></span><div><strong>${esc(item.event_type)} · ${esc(item.details?.protocol || "")}/${esc(item.details?.port ?? "")} · ${esc(item.details?.process_name || "Process unavailable")} (PID ${esc(item.details?.pid ?? "unavailable")})</strong><small>${esc(fmtTime(item.details?.detected_at || item.created_at))} · ${esc(item.details?.local_address || "")} · ${esc(item.details?.executable || "Executable unavailable")}</small><p>${esc(item.details?.reason || "No reason recorded.")}</p><p><strong>Recommended:</strong> ${esc(item.details?.recommendation || "Review this event in context.")}</p></div></div>`).join("") : '<div class="empty-state">No port events recorded.</div>';
+    }
+  }
+
+  function renderUrlScans(scans) {
+    const body = $("urlHistoryTable");
+    if (body) {
+      body.innerHTML = scans?.length
+        ? scans.map((item) => `<tr><td>${esc(fmtTime(item.created_at))}</td><td class="text-break">${esc(item.submitted_url)}</td><td class="text-break">${esc(item.normalized_url)}</td><td>${esc(item.analysis?.destination_type || "UNKNOWN")}</td><td><span class="severity ${severityClass(item.risk_level)}">${esc(item.risk_level)}</span></td><td>${esc(item.risk_score)}</td><td>${esc((item.analysis?.findings || []).map((finding) => finding.code).join(", ") || "None")}</td><td>${esc(item.analysis?.threat_intelligence?.status || "UNVERIFIED")}</td></tr>`).join("")
+        : '<tr><td colspan="8" class="empty-state">No URL scans recorded.</td></tr>';
+    }
+    const recent = $("recentUrlFindings");
+    if (recent) {
+      recent.innerHTML = scans?.length
+        ? scans.slice(0, 5).map((item) => `<div class="event-row"><span class="event-marker"></span><div><strong>${esc(item.risk_level)} heuristic indicators · ${esc(item.domain)} · ${esc(item.risk_score)}/100</strong><small>${esc(item.analysis?.destination_type || "UNKNOWN")} · ${esc(fmtTime(item.created_at))} · Reputation ${esc(item.analysis?.threat_intelligence?.status || "UNVERIFIED")}</small></div></div>`).join("")
+        : '<div class="empty-state">No URL scans recorded.</div>';
+    }
+  }
+
+  function renderUrlResult(result) {
+    const panel = $("urlResultPanel");
+    if (!panel) return;
+    panel.hidden = false;
+    $("urlScanTimestamp").textContent = `Scan #${result.id} · ${fmtTime(result.created_at)} · ${result.model}`;
+    $("urlRiskLevel").textContent = result.risk_level;
+    $("urlRiskLevel").className = `severity ${severityClass(result.risk_level)}`;
+    $("urlRiskScore").textContent = `${result.risk_score}/100`;
+    $("urlHttpsStatus").textContent = result.https ? "Yes (not sufficient)" : "No";
+    $("urlReputationStatus").textContent = result.threat_intelligence.status;
+    $("urlRedirectStatus").textContent = result.redirect_chain.status;
+    $("urlSubmitted").textContent = result.submitted_url;
+    $("urlNormalized").textContent = result.normalized_url;
+    $("urlDomain").textContent = result.domain;
+    $("urlDestinationType").textContent = result.destination_type || "UNKNOWN";
+    $("urlDestinationMessage").textContent = result.destination_message || "Destination context is unknown.";
+    const components = result.risk_components || {};
+    $("urlRiskComponents").textContent = `Structural ${components.structural ?? "unknown"} · Destination ${components.destination ?? "unknown"} · Transport ${components.transport ?? "unknown"} · Reputation ${components.threat_reputation?.status || "UNVERIFIED"}`;
+    $("urlRecommendation").textContent = result.recommended_action;
+    $("urlFindings").innerHTML = result.findings.map((item) => `<tr><td><span class="severity ${severityClass(item.severity)}">${esc(item.severity)}</span></td><td>${esc(item.code)}</td><td>${esc(item.message)}</td><td>${esc(item.points)}</td></tr>`).join("");
+    analyzedUrlToOpen = result.normalized_url;
+    panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   function enableTableSearch() {
     const input = $("tableSearch");
     if (!input) return;
@@ -295,9 +557,10 @@
 
   function renderState(data) {
     window.asrmsHistory = data.history || [];
+    isAdministrator = data.administrator === true;
     const scan = data.latest_scan;
-    const stale = data.assessment_status === "stale" || scan?.status === "stale";
-    if (scan) renderOverview(scan, data.firewall_rules || [], stale);
+    const stale = data.assessment_status !== "verified" || scan?.status !== "verified";
+    if (scan) renderOverview(scan, data.firewall_rules || [], stale, data.firewall_profiles, data.port_monitoring);
     else if (data.assessment_status === "stale") {
       setStatus(`Assessment stale: ${data.assessment_error || data.error || "verification failed"}`, "error");
     }
@@ -311,6 +574,11 @@
     renderEvents(data.events || [], $("eventsList"));
     renderEvents(data.events || [], $("auditList"));
     renderMonitoring(data.monitoring || {});
+    renderFirewallProfiles(data.firewall_profiles, scan?.risk?.firewall_health);
+    renderPortMonitoring(data.port_monitoring || {});
+    renderUrlScans(data.url_scans || []);
+    renderRiskUrlContext(scan?.risk?.url_security_observations);
+    renderSecurityNotifications(data.security_notifications || []);
     if ($("operationStatus") && data.assessment_status === "stale") {
       setStatus(`Assessment stale: ${data.assessment_error || "live state changed; run a complete scan."}`, "error");
     }
@@ -458,8 +726,41 @@
     event.preventDefault();
     confirmRestriction($("ruleProtocol").value, Number($("rulePort").value));
   });
+  const urlForm = $("urlScanForm");
+  if (urlForm) urlForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const url = $("urlInput").value.trim();
+    const button = urlForm.querySelector('button[type="submit"]');
+    button.disabled = true;
+    setStatus("Analyzing URL locally. No network request or third-party reputation lookup will be made.");
+    try {
+      const result = await getJson("/api/url-scans", {
+        method: "POST",
+        body: JSON.stringify({ url })
+      });
+      renderUrlResult(result);
+      const sync = await refresh();
+      setStatus(
+        `URL assessment #${result.id}: ${result.risk_level} risk (${result.risk_score}/100). Reputation and redirects remain unverified.`,
+        sync.ok ? "success" : "warning"
+      );
+    } catch (error) {
+      setStatus(error.message, "error");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  const openAnalyzedUrl = $("openAnalyzedUrl");
+  if (openAnalyzedUrl) openAnalyzedUrl.addEventListener("click", () => {
+    if (!analyzedUrlToOpen) return;
+    if (!window.confirm("This URL has not been reputation-checked, and the risk assessment cannot guarantee safety. Open it anyway?")) return;
+    window.open(analyzedUrlToOpen, "_blank", "noopener,noreferrer");
+  });
+  const notificationFilter = $("notificationFilter");
+  if (notificationFilter) notificationFilter.addEventListener("change", () => renderSecurityNotifications(securityNotifications));
   const menuToggle = $("menuToggle");
   if (menuToggle) menuToggle.addEventListener("click", () => $("sidebar").classList.toggle("open"));
+  bindReportDownloads();
   enableTableSearch();
   refresh();
   setInterval(refresh, 5000);

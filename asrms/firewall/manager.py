@@ -66,11 +66,14 @@ def list_inbound_block_rules(instance_id=None):
         "($_.InstanceID -eq $env:ASRMS_INSTANCE_ID -and $env:ASRMS_INSTANCE_ID) }; "
         "$result = foreach ($rule in $rules) { "
         "$filter = $rule | Get-NetFirewallPortFilter -ErrorAction Stop; "
+        "$address = $rule | Get-NetFirewallAddressFilter -ErrorAction Stop; "
         "[pscustomobject]@{name=$rule.DisplayName; enabled=($rule.Enabled -eq 'True'); "
         "instance_id=[string]$rule.InstanceID; "
         "direction=[string]$rule.Direction; action=[string]$rule.Action; "
         "protocol=[string]$filter.Protocol; port=$filter.LocalPort; "
-        "profiles=[string]$rule.Profile} }; "
+        "profiles=[string]$rule.Profile; "
+        "local_addresses=[string](@($address.LocalAddress) -join ','); "
+        "remote_addresses=[string](@($address.RemoteAddress) -join ',')} }; "
         "$result | ConvertTo-Json -Compress -Depth 3"
     )
     environment = {"ASRMS_INSTANCE_ID": instance_id} if instance_id else {}
@@ -84,6 +87,99 @@ def list_inbound_block_rules(instance_id=None):
     if data is None:
         return []
     return data if isinstance(data, list) else [data]
+
+
+def get_firewall_profiles():
+    script = (
+        "Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop | "
+        "Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction | "
+        "ConvertTo-Json -Compress"
+    )
+    output = _powershell(script, {}, timeout=15)
+    if not output:
+        raise FirewallError("Windows Firewall returned no profile status.")
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError as exc:
+        raise FirewallError("Could not parse Windows Firewall profile status.") from exc
+    records = data if isinstance(data, list) else [data]
+    profiles = []
+    firewall_actions = {0: "NotConfigured", 2: "Allow", 4: "Block"}
+    for record in records:
+        if not isinstance(record, dict):
+            raise FirewallError("Windows Firewall returned an invalid profile record.")
+        name = str(record.get("Name", "")).lower()
+        if name not in {"domain", "private", "public"}:
+            continue
+        enabled = record.get("Enabled")
+        if isinstance(enabled, str):
+            lowered = enabled.lower()
+            if lowered in {"true", "1"}:
+                enabled = True
+            elif lowered in {"false", "0"}:
+                enabled = False
+        elif type(enabled) is int and enabled in {0, 1}:
+            enabled = bool(enabled)
+        if not isinstance(enabled, bool):
+            raise FirewallError(f"Windows Firewall did not report enabled status for {name}.")
+        inbound = record.get("DefaultInboundAction", "Unknown")
+        outbound = record.get("DefaultOutboundAction", "Unknown")
+        if type(inbound) is int:
+            inbound = firewall_actions.get(inbound, "Unknown")
+        if type(outbound) is int:
+            outbound = firewall_actions.get(outbound, "Unknown")
+        profiles.append(
+            {
+                "name": name.title(),
+                "enabled": enabled,
+                "default_inbound_action": str(inbound),
+                "default_outbound_action": str(outbound),
+            }
+        )
+    if {item["name"].lower() for item in profiles} != {"domain", "private", "public"}:
+        raise FirewallError("Windows Firewall did not return all three profile statuses.")
+    return {
+        "collection_status": "verified",
+        "verified_at": None,
+        "profiles": sorted(profiles, key=lambda item: item["name"]),
+        "error": None,
+    }
+
+
+def _gpo_boolean_value(value):
+    if type(value) is bool:
+        return "True" if value else "False"
+    if isinstance(value, str):
+        values = {
+            "true": "True",
+            "false": "False",
+            "notconfigured": "NotConfigured",
+        }
+        normalized = value.strip().lower()
+        if normalized in values:
+            return values[normalized]
+    raise ValueError("Firewall profile state must be True, False, or NotConfigured.")
+
+
+def set_firewall_profile(profile_name, enabled):
+    profile = str(profile_name or "").title()
+    if profile not in {"Domain", "Private", "Public"}:
+        raise ValueError("Profile must be Domain, Private, or Public.")
+    gpo_boolean = _gpo_boolean_value(enabled)
+    script = (
+        "Import-Module NetSecurity -ErrorAction Stop; "
+        "$enabled = [System.Enum]::Parse("
+        "[Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetSecurity.GpoBoolean], "
+        "$env:ASRMS_ENABLED, $true); "
+        "Set-NetFirewallProfile -Profile $env:ASRMS_PROFILE -Enabled $enabled "
+        "-ErrorAction Stop"
+    )
+    _powershell(
+        script,
+        {"ASRMS_PROFILE": profile, "ASRMS_ENABLED": gpo_boolean},
+        timeout=20,
+    )
+    return get_firewall_profiles()
 
 
 def list_managed_rules():
@@ -167,6 +263,27 @@ def matches_rule(rule, protocol, port):
         and str(rule.get("action", "")).lower() == "block"
         and observed_protocol == protocol
         and port_matches
+        and _all_profiles(rule.get("profiles"))
+        and _unrestricted_addresses(rule.get("local_addresses"))
+        and _unrestricted_addresses(rule.get("remote_addresses"))
+    )
+
+
+def _tokens(value):
+    if isinstance(value, list):
+        return [str(item).strip().lower() for item in value]
+    return [item.strip().lower() for item in str(value or "").split(",")]
+
+
+def _all_profiles(value):
+    tokens = set(_tokens(value))
+    return "any" in tokens or {"domain", "private", "public"}.issubset(tokens)
+
+
+def _unrestricted_addresses(value):
+    tokens = set(_tokens(value))
+    return bool(tokens) and tokens.issubset(
+        {"any", "*", "0.0.0.0/0", "::/0"}
     )
 
 
@@ -179,6 +296,9 @@ def rule_covers_port(rule, protocol, port):
         or str(rule.get("direction", "")).lower() != "inbound"
         or str(rule.get("action", "")).lower() != "block"
         or observed_protocol not in {protocol, "ANY"}
+        or not _all_profiles(rule.get("profiles"))
+        or not _unrestricted_addresses(rule.get("local_addresses"))
+        or not _unrestricted_addresses(rule.get("remote_addresses"))
     ):
         return False
     values = rule.get("port", "")
